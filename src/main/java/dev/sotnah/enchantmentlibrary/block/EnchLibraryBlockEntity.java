@@ -25,6 +25,11 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.Container;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.enchantment.Enchantment;
@@ -56,13 +61,18 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
         }
     }
 
+    // ── Item Handler Slot Indices ────────────────────────────────────────────
+    public static final int BOOK_SLOT = 0;
+    public static final int DISENCHANT_SLOT = 1;
+
     protected final Object2LongMap<Holder<Enchantment>> points = new Object2LongOpenHashMap<>();
     protected final Object2IntMap<Holder<Enchantment>> maxLevels = new Object2IntOpenHashMap<>();
     protected final Set<EnchLibraryMenu> activeMenus = ConcurrentHashMap.newKeySet();
-    protected final IItemHandler itemHandler = new EnchLibItemHandler();
+    protected final EnchLibItemHandler itemHandler = new EnchLibItemHandler();
 
     protected final Tier tier;
     private int lastAppliedConfigEpoch = Integer.MIN_VALUE;
+    private boolean redstonePowered = false;
 
     protected EnchLibraryBlockEntity(@Nonnull BlockEntityType<?> type, @Nonnull BlockPos pos, @Nonnull BlockState state,
             Tier tier) {
@@ -248,6 +258,56 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
         return 1L << (level - 1); // 2^(level-1)
     }
 
+    // ── Redstone Automation (auto-disenchant) ──────────────────────────────────
+
+    /**
+     * Called by {@link EnchLibraryBlock} whenever a neighbor change could affect
+     * this block's redstone power state. Triggers {@link #processAutoDisenchant()}
+     * on the rising edge (unpowered -> powered) only, so a held redstone signal
+     * doesn't reprocess every tick.
+     */
+    public void updateRedstoneState(boolean powered) {
+        if (powered == this.redstonePowered) {
+            return;
+        }
+        this.redstonePowered = powered;
+        if (powered && this.level != null && !this.level.isClientSide) {
+            this.processAutoDisenchant();
+        }
+    }
+
+    /**
+     * Disenchants (and destroys) whatever is currently queued in the
+     * auto-disenchant slot, depositing its enchantments into this library. This
+     * mirrors the manual "destroy to disenchant" GUI action, but is intended for
+     * hopper/automation-fed items triggered by a redstone signal.
+     */
+    public void processAutoDisenchant() {
+        if (!Config.enableRedstoneAutoDisenchant.get()) {
+            return;
+        }
+        this.ensureConfigApplied();
+
+        ItemStack queued = this.itemHandler.getDisenchantSlotStack();
+        if (queued.isEmpty()) {
+            return;
+        }
+        if (EnchantmentHelper.getEnchantmentsForCrafting(queued).isEmpty()) {
+            // Nothing to extract; leave the item queued rather than silently voiding it.
+            return;
+        }
+
+        this.depositEnchantsFromItem(queued);
+        this.itemHandler.clearDisenchantSlot();
+
+        if (this.level != null) {
+            this.level.playSound(null, this.worldPosition, SoundEvents.ENCHANTMENT_TABLE_USE, SoundSource.BLOCKS, 1.0F,
+                    1.0F);
+        }
+
+        this.markUpdated();
+    }
+
     // ── Data Component Conversion ──────────────────────────────────────────────
 
     @Override
@@ -297,6 +357,10 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
     protected void saveAdditional(@Nonnull CompoundTag tag, @Nonnull HolderLookup.Provider registries) {
         super.saveAdditional(tag, registries);
         writeEnchData(tag, registries);
+        ItemStack queued = this.itemHandler.getDisenchantSlotStack();
+        if (!queued.isEmpty()) {
+            tag.put("disenchant_slot", queued.save(registries, new CompoundTag()));
+        }
     }
 
     @Override
@@ -306,6 +370,10 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
     protected void loadAdditional(@Nonnull CompoundTag tag, @Nonnull HolderLookup.Provider registries) {
         super.loadAdditional(tag, registries);
         readEnchData(tag, registries.lookupOrThrow(Registries.ENCHANTMENT));
+        if (tag.contains("disenchant_slot")) {
+            this.itemHandler.setStackInSlot(DISENCHANT_SLOT,
+                    ItemStack.parseOptional(registries, tag.getCompound("disenchant_slot")));
+        }
         this.ensureConfigApplied();
     }
 
@@ -502,13 +570,35 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
 
     // ── IItemHandler (hopper support) ──────────────────────────────────────────
 
-    private class EnchLibItemHandler implements IItemHandlerModifiable {
+    /**
+     * Backs the block's hopper-facing capability with two logical slots:
+     * <ul>
+     * <li>{@link #BOOK_SLOT} — enchanted books are consumed immediately on
+     * insertion and converted into stored points (unchanged legacy
+     * behavior).</li>
+     * <li>{@link #DISENCHANT_SLOT} — any other enchanted item (tools, armor,
+     * etc.) queues here. Queued items are disenchanted and destroyed in bulk
+     * by {@link #processAutoDisenchant()} whenever the block receives a
+     * redstone signal.</li>
+     * </ul>
+     */
+    class EnchLibItemHandler implements IItemHandlerModifiable {
 
-        private ItemStack stack = ItemStack.EMPTY;
+        private ItemStack bookSlot = ItemStack.EMPTY;
+        private ItemStack disenchantSlot = ItemStack.EMPTY;
 
         @Override
         public int getSlots() {
-            return 1;
+            return 2;
+        }
+
+        @Nonnull
+        ItemStack getDisenchantSlotStack() {
+            return this.disenchantSlot;
+        }
+
+        void clearDisenchantSlot() {
+            this.disenchantSlot = ItemStack.EMPTY;
         }
 
         @Override
@@ -516,30 +606,44 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
         // Suppressed: vanilla ItemStack.EMPTY field lacks @Nonnull
         @SuppressWarnings("null")
         public ItemStack getStackInSlot(int slot) {
-            return this.stack;
+            if (slot == DISENCHANT_SLOT)
+                return this.disenchantSlot;
+            return this.bookSlot;
         }
 
         @Override
         public void setStackInSlot(int slot, @Nonnull ItemStack stack) {
-            this.stack = stack;
+            if (slot == DISENCHANT_SLOT) {
+                this.disenchantSlot = stack;
+            } else if (slot == BOOK_SLOT) {
+                this.bookSlot = stack;
+            }
         }
 
-        /**
-         * Acts as a "deposit chute" for automated systems (like hoppers).
-         * Enchanted books inserted here are immediately consumed and converted to
-         * points,
-         * rather than being stored in a physical slot. This keeps the handler logically
-         * "empty"
-         * even during rapid insertion.
-         */
         @Override
         @Nonnull
         // Suppressed: vanilla Items.ENCHANTED_BOOK and ItemStack.EMPTY lack @Nonnull
         @SuppressWarnings("null")
         public ItemStack insertItem(int slot, @Nonnull ItemStack stack, boolean simulate) {
-            // Validation: Only slot 0, non-empty enchanted books, and respect our own slot
-            // limit
-            if (slot != 0 || stack.isEmpty() || !stack.is(Items.ENCHANTED_BOOK) || !this.stack.isEmpty())
+            if (slot == BOOK_SLOT) {
+                return insertBook(stack, simulate);
+            }
+            if (slot == DISENCHANT_SLOT) {
+                return insertDisenchantCandidate(stack, simulate);
+            }
+            return stack;
+        }
+
+        /**
+         * Acts as a "deposit chute" for automated systems (like hoppers).
+         * Enchanted books inserted here are immediately consumed and converted to
+         * points, rather than being stored in a physical slot. This keeps the
+         * handler logically "empty" even during rapid insertion.
+         */
+        @Nonnull
+        @SuppressWarnings("null")
+        private ItemStack insertBook(@Nonnull ItemStack stack, boolean simulate) {
+            if (stack.isEmpty() || !stack.is(Items.ENCHANTED_BOOK) || !this.bookSlot.isEmpty())
                 return stack;
 
             // We behave as a slot with limit 1: accept 1, return the rest.
@@ -551,12 +655,55 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
                     ItemStack toDeposit = stack.copyWithCount(1);
                     EnchLibraryBlockEntity.this.depositBook(toDeposit);
                 } catch (Exception e) {
-                    LOGGER.error("Failed to deposit book into library at {}", EnchLibraryBlockEntity.this.worldPosition,
-                            e);
+                    LOGGER.error("Failed to deposit book into library at {}", EnchLibraryBlockEntity.this.worldPosition,e);
                     return stack;
                 }
             }
 
+            return remainder.isEmpty() ? ItemStack.EMPTY : remainder;
+        }
+
+        /**
+         * Queues an enchanted item (tool/armor/etc.) for destructive disenchanting.
+         * The item is held as-is (not consumed) until a redstone signal triggers
+         * {@link #processAutoDisenchant()}; this lets automation "stage" items ahead
+         * of time and fire the destruction on demand.
+         */
+        @Nonnull
+        @SuppressWarnings("null")
+        private ItemStack insertDisenchantCandidate(@Nonnull ItemStack stack, boolean simulate) {
+            if (stack.isEmpty() || !Config.enableRedstoneAutoDisenchant.get()
+                    || EnchantmentHelper.getEnchantmentsForCrafting(stack).isEmpty()) {
+                return stack;
+            }
+
+            int limit = getSlotLimit(DISENCHANT_SLOT);
+
+            if (this.disenchantSlot.isEmpty()) {
+                int accepted = Math.min(stack.getCount(), limit);
+                if (accepted <= 0)
+                    return stack;
+                if (!simulate) {
+                    this.disenchantSlot = stack.copyWithCount(accepted);
+                }
+                ItemStack remainder = stack.copy();
+                remainder.shrink(accepted);
+                return remainder.isEmpty() ? ItemStack.EMPTY : remainder;
+            }
+
+            if (!ItemStack.isSameItemSameComponents(this.disenchantSlot, stack)) {
+                return stack;
+            }
+            int room = limit - this.disenchantSlot.getCount();
+            if (room <= 0) {
+                return stack;
+            }
+            int accepted = Math.min(stack.getCount(), room);
+            if (!simulate) {
+                this.disenchantSlot.grow(accepted);
+            }
+            ItemStack remainder = stack.copy();
+            remainder.shrink(accepted);
             return remainder.isEmpty() ? ItemStack.EMPTY : remainder;
         }
 
@@ -570,17 +717,79 @@ public abstract class EnchLibraryBlockEntity extends BlockEntity {
 
         @Override
         public int getSlotLimit(int slot) {
-            return 1;
+            return slot == DISENCHANT_SLOT ? Config.autoDisenchantSlotLimit.get() : 1;
         }
 
         @Override
         // Suppressed: vanilla Items.ENCHANTED_BOOK field lacks @Nonnull
         @SuppressWarnings("null")
         public boolean isItemValid(int slot, @Nonnull ItemStack stack) {
-            return stack.is(Items.ENCHANTED_BOOK);
+            if (slot == BOOK_SLOT) {
+                return stack.is(Items.ENCHANTED_BOOK);
+            }
+            if (slot == DISENCHANT_SLOT) {
+                return Config.enableRedstoneAutoDisenchant.get() && !EnchantmentHelper.getEnchantmentsForCrafting(stack).isEmpty();
+            }
+            return false;
         }
     }
+    
+    public Container getDisenchantContainer() {
+    return new SimpleContainer() {
 
+        @Override
+        public int getContainerSize() {
+            return 1;
+        }
+
+        @Override
+        public ItemStack getItem(int slot) {
+            return itemHandler.getStackInSlot(DISENCHANT_SLOT);
+        }
+
+        @Override
+        public ItemStack removeItem(int slot, int amount) {
+            ItemStack current = itemHandler.getStackInSlot(DISENCHANT_SLOT);
+
+            if (current.isEmpty()) {
+                return ItemStack.EMPTY;
+            }
+
+            ItemStack result = current.split(amount);
+
+            if (current.isEmpty()) {
+                itemHandler.setStackInSlot(DISENCHANT_SLOT, ItemStack.EMPTY);
+            }
+
+            markUpdated();
+            return result;
+        }
+
+        @Override
+        public ItemStack removeItemNoUpdate(int slot) {
+                ItemStack current = itemHandler.getStackInSlot(DISENCHANT_SLOT);
+                itemHandler.setStackInSlot(DISENCHANT_SLOT, ItemStack.EMPTY);
+                markUpdated();
+                return current;
+            }
+
+            @Override
+            public void setItem(int slot, ItemStack stack) {
+                itemHandler.setStackInSlot(DISENCHANT_SLOT, stack);
+                markUpdated();
+            }
+
+            @Override
+            public void setChanged() {
+                markUpdated();
+            }
+
+            @Override
+            public boolean stillValid(Player player) {
+                return true;
+            }
+        };
+    }
     // ── Tier Implementations ───────────────────────────────────────────────────
 
     public static class Tier1Tile extends EnchLibraryBlockEntity {

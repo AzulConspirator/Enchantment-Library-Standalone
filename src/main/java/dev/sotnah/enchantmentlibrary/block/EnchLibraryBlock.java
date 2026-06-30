@@ -1,3 +1,4 @@
+
 package dev.sotnah.enchantmentlibrary.block;
 
 import java.util.List;
@@ -142,6 +143,21 @@ public class EnchLibraryBlock extends HorizontalDirectionalBlock implements Enti
         return null;
     }
 
+    // ── Redstone Automation ───────────────────────────────────────────────────
+
+    @Override
+    protected void neighborChanged(@Nonnull BlockState state, @Nonnull Level level, @Nonnull BlockPos pos,
+            @Nonnull Block neighborBlock, @Nonnull BlockPos neighborPos, boolean movedByPiston) {
+        super.neighborChanged(state, level, pos, neighborBlock, neighborPos, movedByPiston);
+        if (level.isClientSide) {
+            return;
+        }
+        BlockEntity be = level.getBlockEntity(pos);
+        if (be instanceof EnchLibraryBlockEntity lib) {
+            lib.updateRedstoneState(level.hasNeighborSignal(pos));
+        }
+    }
+
     // ── Data Component Persistence ─────────────────────────────────────────────
 
     @Override
@@ -214,3 +230,5 @@ public class EnchLibraryBlock extends HorizontalDirectionalBlock implements Enti
         return this.maxLevel;
     }
 }
+
+

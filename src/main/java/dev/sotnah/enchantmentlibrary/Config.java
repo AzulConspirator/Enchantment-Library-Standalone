@@ -39,6 +39,9 @@ public class Config {
 
     public static final ModConfigSpec.BooleanValue enableDisenchantButton;
 
+    public static final ModConfigSpec.BooleanValue enableRedstoneAutoDisenchant;
+    public static final ModConfigSpec.IntValue autoDisenchantSlotLimit;
+
     public static final ModConfigSpec.IntValue baseXpMultiplier;
     public static final ModConfigSpec.BooleanValue requireXpForExtraction;
 
@@ -78,6 +81,16 @@ public class Config {
         enableDisenchantButton = BUILDER
                 .comment("Enables/disables disenchant button functionality.")
                 .define("enableDisenchantButton", true);
+
+        enableRedstoneAutoDisenchant = BUILDER
+                .comment(
+                        "If true, items (tools/armor) inserted into the library's automation slot (e.g. via hopper) "
+                                + "are disenchanted automatically whenever the block receives a redstone signal.")
+                .define("enableRedstoneAutoDisenchant", true);
+
+        autoDisenchantSlotLimit = BUILDER
+                .comment("Maximum number of items that can queue in the auto-disenchant slot at once.")
+                .defineInRange("autoDisenchantSlotLimit", 64, 1, 64);
 
         keepInventory = BUILDER
                 .comment("If true, library keeps stored data when broken.")
@@ -193,3 +206,5 @@ public class Config {
         return BLACKLIST_CACHE.contains(id);
     }
 }
+
+

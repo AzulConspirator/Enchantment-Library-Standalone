@@ -47,7 +47,7 @@ public class EnchLibraryMenu extends AbstractContainerMenu {
     private final BlockPos blockPos;
     private final Level level;
     private final Player player;
-    private final SimpleContainer ioInv = new SimpleContainer(3);
+    private final SimpleContainer ioInv = new SimpleContainer(2);
     private Runnable notifier;
     private ItemStack activeOutputBook = ItemStack.EMPTY;
 
@@ -143,7 +143,18 @@ public class EnchLibraryMenu extends AbstractContainerMenu {
         });
 
         // Slot 2: Item filter slot (any item, used to filter visible enchantments)
-        this.addSlot(new Slot(this.ioInv, FILTER_SLOT, 143, 37) {
+        this.addSlot(new Slot(self.tile.getDisenchantContainer(),0,143,37
+        ) {
+            @Override
+            public boolean mayPlace(@Nonnull ItemStack stack) {
+                return !EnchantmentHelper.getEnchantmentsForCrafting(stack).isEmpty();
+            }
+
+            @Override
+            public int getMaxStackSize() {
+                return dev.sotnah.enchantmentlibrary.Config.autoDisenchantSlotLimit.get();
+            }
+
             @Override
             public void setChanged() {
                 super.setChanged();
@@ -237,7 +248,7 @@ public class EnchLibraryMenu extends AbstractContainerMenu {
             if (!dev.sotnah.enchantmentlibrary.Config.enableDisenchantButton.get()) {
                 return false;
             }
-            ItemStack filterItem = this.ioInv.getItem(FILTER_SLOT);
+            ItemStack filterItem = this.tile.getItemHandler().getStackInSlot(EnchLibraryBlockEntity.DISENCHANT_SLOT);
             if (filterItem.isEmpty() || filterItem.is(Items.ENCHANTED_BOOK)) {
                 return false;
             }
@@ -248,7 +259,7 @@ public class EnchLibraryMenu extends AbstractContainerMenu {
 
             // Dupe prevention: clear slot first, then deposit using the removed stack.
             ItemStack toDeposit = filterItem.copy();
-            this.ioInv.setItem(FILTER_SLOT, ItemStack.EMPTY);
+           this.tile.getItemHandler().extractItem(EnchLibraryBlockEntity.DISENCHANT_SLOT,filterItem.getCount(),false);
             this.tile.depositEnchantsFromItem(toDeposit);
             // Success SFX: play two sounds together.
             this.level.playSound(null, this.tile.getBlockPos(), SoundEvents.ENCHANTMENT_TABLE_USE,
